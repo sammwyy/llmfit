@@ -48,6 +48,16 @@ impl From<SortArg> for SortColumn {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum FitArg {
+    All,
+    Perfect,
+    Good,
+    Marginal,
+    Tight,
+    Runnable,
+}
+
 #[derive(Parser)]
 #[command(name = "llmfit")]
 #[command(about = "Right-size LLM models to your system's hardware", long_about = None)]
@@ -120,6 +130,27 @@ enum Commands {
     Info {
         /// Model name or partial name to look up
         model: String,
+    },
+
+    /// Compare two models side-by-side, or auto-compare top N filtered models
+    Diff {
+        /// First model selector (name or unique partial name)
+        model_a: Option<String>,
+
+        /// Second model selector (name or unique partial name)
+        model_b: Option<String>,
+
+        /// Sort column before selecting candidates
+        #[arg(long, value_enum, default_value_t = SortArg::Score)]
+        sort: SortArg,
+
+        /// Fit-level filter before candidate selection
+        #[arg(long, value_enum, default_value_t = FitArg::Runnable)]
+        fit: FitArg,
+
+        /// Number of top models to include when model names are omitted
+        #[arg(short = 'n', long, default_value_t = 2)]
+        limit: usize,
     },
 
     /// Plan hardware requirements for a specific model configuration
@@ -321,6 +352,133 @@ fn run_fit(
             );
         }
         display::display_model_fits(&fits);
+    }
+}
+
+fn fit_matches_filter(fit: &ModelFit, filter: FitArg) -> bool {
+    match filter {
+        FitArg::All => true,
+        FitArg::Perfect => fit.fit_level == llmfit_core::fit::FitLevel::Perfect,
+        FitArg::Good => fit.fit_level == llmfit_core::fit::FitLevel::Good,
+        FitArg::Marginal => fit.fit_level == llmfit_core::fit::FitLevel::Marginal,
+        FitArg::Tight => fit.fit_level == llmfit_core::fit::FitLevel::TooTight,
+        FitArg::Runnable => fit.fit_level != llmfit_core::fit::FitLevel::TooTight,
+    }
+}
+
+fn find_fit_index_by_selector(fits: &[ModelFit], selector: &str) -> Result<usize, String> {
+    let needle = selector.trim().to_lowercase();
+    if needle.is_empty() {
+        return Err("Model selector cannot be empty".to_string());
+    }
+
+    if let Some((idx, _)) = fits
+        .iter()
+        .enumerate()
+        .find(|(_, f)| f.model.name.to_lowercase() == needle)
+    {
+        return Ok(idx);
+    }
+
+    let matches: Vec<(usize, &str)> = fits
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            if f.model.name.to_lowercase().contains(&needle) {
+                Some((i, f.model.name.as_str()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [] => Err(format!("No model found matching '{}'", selector)),
+        [(idx, _)] => Ok(*idx),
+        _ => {
+            let names = matches
+                .iter()
+                .take(8)
+                .map(|(_, name)| format!("  - {}", name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(format!(
+                "Multiple models match '{}'. Please be more specific:\n{}",
+                selector, names
+            ))
+        }
+    }
+}
+
+fn run_diff(
+    model_a: Option<String>,
+    model_b: Option<String>,
+    fit_filter: FitArg,
+    sort: SortColumn,
+    limit: usize,
+    json: bool,
+    memory_override: &Option<String>,
+    context_limit: Option<u32>,
+) {
+    if limit < 2 {
+        eprintln!("Error: --limit must be at least 2 for diff");
+        std::process::exit(1);
+    }
+
+    if (model_a.is_some() && model_b.is_none()) || (model_a.is_none() && model_b.is_some()) {
+        eprintln!("Error: provide both model selectors, or neither to auto-compare top N");
+        std::process::exit(1);
+    }
+
+    let specs = detect_specs(memory_override);
+    let db = ModelDatabase::new();
+
+    let mut fits: Vec<ModelFit> = db
+        .get_all_models()
+        .iter()
+        .filter(|m| backend_compatible(m, &specs))
+        .map(|m| ModelFit::analyze_with_context_limit(m, &specs, context_limit))
+        .collect();
+
+    fits.retain(|f| fit_matches_filter(f, fit_filter));
+    fits = llmfit_core::fit::rank_models_by_fit_opts_col(fits, false, sort);
+
+    let selected: Vec<ModelFit> =
+        if let (Some(a), Some(b)) = (model_a.as_deref(), model_b.as_deref()) {
+            let a_idx = match find_fit_index_by_selector(&fits, a) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let b_idx = match find_fit_index_by_selector(&fits, b) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            if a_idx == b_idx {
+                eprintln!("Error: both selectors resolved to the same model");
+                std::process::exit(1);
+            }
+
+            vec![fits[a_idx].clone(), fits[b_idx].clone()]
+        } else {
+            if fits.len() < 2 {
+                eprintln!("Error: need at least 2 models after filtering to compare");
+                std::process::exit(1);
+            }
+            fits.into_iter().take(limit).collect()
+        };
+
+    if json {
+        display::display_json_diff_fits(&specs, &selected);
+    } else {
+        specs.display();
+        display::display_model_diff(&selected, sort.label());
     }
 }
 
@@ -859,7 +1017,15 @@ fn main() {
 
             Commands::List => {
                 let db = ModelDatabase::new();
-                display::display_all_models(db.get_all_models());
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(db.get_all_models())
+                            .expect("JSON serialization failed")
+                    );
+                } else {
+                    display::display_all_models(db.get_all_models());
+                }
             }
 
             Commands::Fit {
@@ -907,6 +1073,25 @@ fn main() {
                 } else {
                     display::display_model_detail(&fit);
                 }
+            }
+
+            Commands::Diff {
+                model_a,
+                model_b,
+                sort,
+                fit,
+                limit,
+            } => {
+                run_diff(
+                    model_a,
+                    model_b,
+                    fit,
+                    sort.into(),
+                    limit,
+                    cli.json,
+                    &cli.memory,
+                    context_limit,
+                );
             }
 
             Commands::Plan {
@@ -993,5 +1178,83 @@ fn main() {
     if let Err(e) = run_tui(&cli.memory, context_limit) {
         eprintln!("Error running TUI: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llmfit_core::fit::{FitLevel, InferenceRuntime, RunMode, ScoreComponents};
+    use llmfit_core::models::LlmModel;
+
+    fn mock_fit(name: &str, fit_level: FitLevel) -> ModelFit {
+        ModelFit {
+            model: LlmModel {
+                name: name.to_string(),
+                provider: "test".to_string(),
+                parameter_count: "7B".to_string(),
+                parameters_raw: None,
+                min_ram_gb: 4.0,
+                recommended_ram_gb: 8.0,
+                min_vram_gb: Some(4.0),
+                quantization: "Q4_K_M".to_string(),
+                context_length: 8192,
+                use_case: "general".to_string(),
+                is_moe: false,
+                num_experts: None,
+                active_experts: None,
+                active_parameters: None,
+                release_date: Some("2025-01-01".to_string()),
+                gguf_sources: vec![],
+                capabilities: vec![],
+            },
+            fit_level,
+            run_mode: RunMode::Gpu,
+            memory_required_gb: 4.0,
+            memory_available_gb: 8.0,
+            utilization_pct: 50.0,
+            notes: vec![],
+            moe_offloaded_gb: None,
+            score: 80.0,
+            score_components: ScoreComponents {
+                quality: 80.0,
+                speed: 80.0,
+                fit: 80.0,
+                context: 80.0,
+            },
+            estimated_tps: 30.0,
+            best_quant: "Q4_K_M".to_string(),
+            use_case: llmfit_core::models::UseCase::General,
+            runtime: InferenceRuntime::LlamaCpp,
+            installed: false,
+        }
+    }
+
+    #[test]
+    fn fit_filter_runnable_excludes_too_tight() {
+        let runnable = mock_fit("alpha/model", FitLevel::Good);
+        let tight = mock_fit("beta/model", FitLevel::TooTight);
+        assert!(fit_matches_filter(&runnable, FitArg::Runnable));
+        assert!(!fit_matches_filter(&tight, FitArg::Runnable));
+    }
+
+    #[test]
+    fn selector_prefers_exact_match() {
+        let fits = vec![
+            mock_fit("org/model-a", FitLevel::Perfect),
+            mock_fit("org/model-a-instruct", FitLevel::Perfect),
+        ];
+        let idx = find_fit_index_by_selector(&fits, "org/model-a").expect("should resolve");
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn selector_errors_on_ambiguous_partial() {
+        let fits = vec![
+            mock_fit("org/model-a", FitLevel::Perfect),
+            mock_fit("org/model-a-instruct", FitLevel::Perfect),
+        ];
+        let err = find_fit_index_by_selector(&fits, "model-a").expect_err("should be ambiguous");
+        assert!(err.contains("Multiple models match"));
     }
 }
